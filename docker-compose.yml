@@ -1,0 +1,16 @@
+services:
+  hono-image:
+    image: ghcr.io/honoacc/hono-image:latest
+    container_name: hono-image
+    restart: unless-stopped
+    ports:
+      - "5190:5190"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 5190
+      HONO_IMAGE_API_PORT: 5190
+    volumes:
+      - hono-image-cache:/app/.hono-image-cache
+
+volumes:
+  hono-image-cache:
