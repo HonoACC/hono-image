@@ -35,6 +35,38 @@ http://127.0.0.1:5188/
 
 The Docker image serves both the built frontend and the task API from one Node process on port `5190`.
 
+Deploy on a server:
+
+```bash
+mkdir -p ~/hono-image
+cd ~/hono-image
+curl -fsSLO https://raw.githubusercontent.com/HonoACC/hono-image/main/docker-compose.yml
+docker compose pull
+docker compose up -d
+```
+
+Upgrade after a new GitHub Actions build:
+
+```bash
+cd ~/hono-image
+docker compose pull
+docker compose up -d
+```
+
+Check container logs:
+
+```bash
+docker compose logs -f hono-image
+```
+
+If the GHCR package is changed to private, log in before pulling:
+
+```bash
+echo 'YOUR_GITHUB_PAT' | docker login ghcr.io -u HonoACC --password-stdin
+```
+
+Run from a local checkout:
+
 ```bash
 docker compose up -d
 ```
