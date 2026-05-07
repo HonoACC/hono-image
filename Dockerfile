@@ -15,9 +15,6 @@ ENV NODE_ENV=production
 ENV HOST=0.0.0.0
 ENV PORT=5190
 
-COPY package*.json ./
-RUN npm ci --omit=dev && npm cache clean --force
-
 COPY --from=build /app/dist ./dist
 COPY server ./server
 

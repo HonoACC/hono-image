@@ -9,6 +9,7 @@ services:
       HOST: 0.0.0.0
       PORT: 5190
       HONO_IMAGE_API_PORT: 5190
+      HONO_IMAGE_ALLOWED_HOSTS: api.honoacc.com,anyone.ai
     volumes:
       - hono-image-cache:/app/.hono-image-cache
 

@@ -26,8 +26,10 @@ import {
 } from '@douyinfe/semi-icons'
 import { ArrowRight, ImagePlus, KeyRound, Sparkles } from 'lucide-react'
 import './App.css'
-import { buildImageTaskDebug, createImageTaskWithProgress, listModels } from './services/imageApi'
+import { buildImageTaskDebug, listModels, pollImageTaskWithProgress, submitImageTask } from './services/imageApi'
+import type { SubmittedImageTask } from './services/imageApi'
 import type { ApiSettings, GenerationParams, ImageApiMode, ImageAsset, ImageMode, ImageModel, ImageTask, ImageTaskDebug } from './types/image'
+import { createClientId } from './utils/id'
 
 const { Header, Content, Sider } = Layout
 const { Title, Text, Paragraph } = Typography
@@ -46,6 +48,11 @@ const apiModeOptions: Array<{ label: string; value: ImageApiMode }> = [
   { label: 'Lobe Chat Image', value: 'chat-image' },
 ]
 const defaultBaseUrl = 'https://api.honoacc.com'
+const apiSettingsStorageKey = 'hono-image-api-settings'
+const apiSessionSettingsStorageKey = 'hono-image-api-session-settings'
+const imageHistoryStorageKey = 'hono-image-history'
+const maxStoredTasks = 20
+const maxStoredDataUrlLength = 1_200_000
 
 function getModeLabel(mode: ImageMode) {
   return modeOptions.find((item) => item.value === mode)?.label ?? mode
@@ -79,7 +86,123 @@ function summarizeFailure(error: unknown, debug?: ImageTaskDebug) {
   return error instanceof Error ? error.message : '图像任务失败。'
 }
 
+function normalizeBaseUrl(baseUrl: string) {
+  return baseUrl.trim().replace(/\/+$/, '') || defaultBaseUrl
+}
+
+function readStoredApiSettings(): ApiSettings {
+  try {
+    const raw = window.localStorage.getItem(apiSettingsStorageKey) || window.sessionStorage.getItem(apiSessionSettingsStorageKey)
+    if (!raw) return { baseUrl: defaultBaseUrl, apiKey: '' }
+
+    const parsed = JSON.parse(raw) as Partial<ApiSettings> & { rememberApiKey?: boolean }
+    return {
+      baseUrl: normalizeBaseUrl(String(parsed.baseUrl || defaultBaseUrl)),
+      apiKey: String(parsed.apiKey || ''),
+    }
+  } catch {
+    return {
+      baseUrl: defaultBaseUrl,
+      apiKey: '',
+    }
+  }
+}
+
+function readStoredRememberApiKey() {
+  try {
+    const raw = window.localStorage.getItem(apiSettingsStorageKey)
+    if (!raw) return false
+    const parsed = JSON.parse(raw) as { rememberApiKey?: boolean }
+    return parsed.rememberApiKey === true
+  } catch {
+    return false
+  }
+}
+
+function persistApiSettings(settings: ApiSettings, rememberApiKey: boolean) {
+  const persisted = {
+    baseUrl: settings.baseUrl,
+    apiKey: rememberApiKey ? settings.apiKey : '',
+    rememberApiKey,
+  }
+  window.localStorage.setItem(apiSettingsStorageKey, JSON.stringify(persisted))
+  if (rememberApiKey) {
+    window.sessionStorage.removeItem(apiSessionSettingsStorageKey)
+    return
+  }
+  window.sessionStorage.setItem(apiSessionSettingsStorageKey, JSON.stringify(settings))
+}
+
+type StoredImageHistory = {
+  selectedAssetId?: string
+  tasks: ImageTask[]
+}
+
+function trimStoredTasks(tasks: ImageTask[]) {
+  return tasks.slice(0, maxStoredTasks)
+}
+
+function stripLargeDataUrls(tasks: ImageTask[]) {
+  return tasks.map((task) => ({
+    ...task,
+    assets: task.assets
+      .filter((asset) => !asset.url.startsWith('data:') || asset.url.length <= maxStoredDataUrlLength)
+      .map((asset) => ({ ...asset })),
+  }))
+}
+
+function readStoredImageHistory(): StoredImageHistory {
+  try {
+    const raw = window.localStorage.getItem(imageHistoryStorageKey)
+    if (!raw) return { tasks: [] }
+
+    const parsed = JSON.parse(raw) as Partial<StoredImageHistory>
+    const tasks = Array.isArray(parsed.tasks) ? parsed.tasks : []
+    return {
+      selectedAssetId: typeof parsed.selectedAssetId === 'string' ? parsed.selectedAssetId : undefined,
+      tasks: trimStoredTasks(tasks),
+    }
+  } catch {
+    return { tasks: [] }
+  }
+}
+
+function persistImageHistory(history: StoredImageHistory) {
+  const payload = {
+    selectedAssetId: history.selectedAssetId,
+    tasks: stripLargeDataUrls(trimStoredTasks(history.tasks)),
+  }
+  window.localStorage.setItem(imageHistoryStorageKey, JSON.stringify(payload))
+}
+
+function tryPersistImageHistory(history: StoredImageHistory) {
+  const attempts = [
+    trimStoredTasks(history.tasks),
+    trimStoredTasks(history.tasks).slice(0, 10),
+    trimStoredTasks(history.tasks).slice(0, 5),
+    trimStoredTasks(history.tasks)
+      .slice(0, 5)
+      .map((task) => ({ ...task, assets: task.assets.filter((asset) => !asset.url.startsWith('data:')) })),
+  ]
+
+  for (const tasks of attempts) {
+    try {
+      persistImageHistory({
+        selectedAssetId: tasks.flatMap((task) => task.assets).some((asset) => asset.id === history.selectedAssetId)
+          ? history.selectedAssetId
+          : undefined,
+        tasks,
+      })
+      return true
+    } catch {
+      // Try a smaller persistence payload below.
+    }
+  }
+  return false
+}
+
 function App() {
+  const storedHistory = readStoredImageHistory()
   const [mode, setMode] = useState<ImageMode>('generate')
   const [models] = useState<ImageModel[]>(() => [])
   const [loadedModels, setLoadedModels] = useState<ImageModel[]>([])
@@ -90,8 +213,10 @@ function App() {
   const [quality, setQuality] = useState('auto')
   const [outputFormat, setOutputFormat] = useState('png')
   const [count, setCount] = useState(1)
-  const [tasks, setTasks] = useState<ImageTask[]>([])
-  const [selectedAsset, setSelectedAsset] = useState<ImageAsset | undefined>()
+  const [tasks, setTasks] = useState<ImageTask[]>(() => storedHistory.tasks)
+  const [selectedAsset, setSelectedAsset] = useState<ImageAsset | undefined>(() => (
+    storedHistory.tasks.flatMap((task) => task.assets).find((asset) => asset.id === storedHistory.selectedAssetId)
+  ))
   const [isGenerating, setIsGenerating] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [lastRun, setLastRun] = useState<{
@@ -102,12 +227,10 @@ function App() {
     message: '等待第一次请求。',
   })
   const [lastDebug, setLastDebug] = useState<ImageTaskDebug | undefined>()
-  const [draftBaseUrl, setDraftBaseUrl] = useState(defaultBaseUrl)
-  const [draftApiKey, setDraftApiKey] = useState('')
-  const [apiSettings, setApiSettings] = useState<ApiSettings>({
-    baseUrl: defaultBaseUrl,
-    apiKey: '',
-  })
+  const [apiSettings, setApiSettings] = useState<ApiSettings>(() => readStoredApiSettings())
+  const [draftBaseUrl, setDraftBaseUrl] = useState(() => readStoredApiSettings().baseUrl)
+  const [draftApiKey, setDraftApiKey] = useState(() => readStoredApiSettings().apiKey)
+  const [rememberApiKey, setRememberApiKey] = useState(() => readStoredRememberApiKey())
 
   useEffect(() => {
     listModels().then((items) => {
@@ -116,6 +239,16 @@ function App() {
     })
   }, [model])
 
+  useEffect(() => {
+    const persisted = tryPersistImageHistory({
+      selectedAssetId: selectedAsset?.id,
+      tasks,
+    })
+    if (!persisted && tasks.length) {
+      Toast.warning('浏览器本地存储空间不足，部分图片历史未能保存。')
+    }
+  }, [selectedAsset?.id, tasks])
+
   const allAssets = tasks.flatMap((task) => task.assets)
   const activeModels = loadedModels.length ? loadedModels : models
 
@@ -123,6 +256,89 @@ function App() {
   const requiresReference = mode !== 'generate'
   const hasApiKey = apiSettings.apiKey.trim().length > 0
   const promptLength = prompt.trim().length
+
+  function updateTaskById(taskId: string, updater: (task: ImageTask) => ImageTask) {
+    setTasks((current) => trimStoredTasks(current.map((task) => (task.id === taskId ? updater(task) : task))))
+  }
+
+  function createProgressHandler(debug: ImageTaskDebug, setLatestDebug?: (debug: ImageTaskDebug) => void) {
+    return (event: SubmittedImageTask['progress']) => {
+      const nextDebug = {
+        endpoint: event.target || debug.endpoint,
+        localEndpoint: debug.localEndpoint || '/api/image-tasks',
+        taskId: event.id,
+        taskStatus: event.status,
+        elapsed: event.elapsed,
+        statusCode: event.statusCode,
+        upstreamTaskId: event.upstreamTaskId,
+        upstreamTaskStatusUrl: event.upstreamTaskStatusUrl,
+        error: event.error,
+        payload: debug.payload,
+      }
+      setLatestDebug?.(nextDebug)
+      setLastDebug(nextDebug)
+      updateTaskById(event.id, (task) => ({
+        ...task,
+        status: event.status === 'queued' ? 'pending' : event.status,
+      }))
+      setLastRun({
+        status: 'running',
+        message: [
+          `本地任务 ${event.id}：${event.status}`,
+          typeof event.elapsed === 'number' ? `elapsed: ${event.elapsed}ms` : '',
+          event.statusCode ? `status: ${event.statusCode}` : '',
+        ].filter(Boolean).join('，'),
+      })
+    }
+  }
+
+  async function resumeTask(task: ImageTask) {
+    if (!task.resumeParams || !hasApiKey) return
+    const debug = buildImageTaskDebug(task.resumeParams, apiSettings)
+    const submittedTask: SubmittedImageTask = {
+      debug,
+      params: task.resumeParams,
+      progress: {
+        id: task.id,
+        status: task.status === 'pending' ? 'queued' : 'running',
+      },
+      submittedAt: task.createdAt,
+    }
+
+    try {
+      const completedTask = await pollImageTaskWithProgress(submittedTask, apiSettings, createProgressHandler(debug))
+      updateTaskById(task.id, () => completedTask)
+      if (!selectedAsset && completedTask.assets[0]) setSelectedAsset(completedTask.assets[0])
+      setLastRun({
+        status: 'succeeded',
+        message: `已恢复并完成任务 ${task.id}，生成 ${completedTask.assets.length} 张图片。`,
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '恢复任务失败。'
+      updateTaskById(task.id, (current) => ({
+        ...current,
+        completedAt: new Date().toISOString(),
+        error: message,
+        status: 'failed',
+      }))
+      setLastRun({ status: 'failed', message })
+    }
+  }
+
+  useEffect(() => {
+    const resumableTasks = tasks.filter((task) => (
+      (task.status === 'pending' || task.status === 'running') && task.resumeParams
+    ))
+    if (!resumableTasks.length || !hasApiKey || isGenerating) return
+    const timer = window.setTimeout(() => {
+      for (const task of resumableTasks) {
+        void resumeTask(task)
+      }
+    }, 0)
+    return () => window.clearTimeout(timer)
+  // Resume only after settings become available on page load.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasApiKey])
 
   async function handleGenerate() {
     if (requiresReference && !selectedAsset) {
@@ -161,41 +377,26 @@ function App() {
       const debug = buildImageTaskDebug(params, apiSettings)
       latestRequestDebug = debug
       setLastDebug(debug)
-      const task = await createImageTaskWithProgress(params, apiSettings, (event) => {
-        latestRequestDebug = {
-          endpoint: event.target || latestRequestDebug?.endpoint || debug.endpoint,
-          localEndpoint: latestRequestDebug?.localEndpoint || debug.localEndpoint,
-          taskId: event.id,
-          taskStatus: event.status,
-          elapsed: event.elapsed,
-          statusCode: event.statusCode,
-          upstreamTaskId: event.upstreamTaskId,
-          upstreamTaskStatusUrl: event.upstreamTaskStatusUrl,
-          error: event.error,
-          payload: latestRequestDebug?.payload || debug.payload,
-        }
-        setLastDebug((current) => ({
-          endpoint: event.target || current?.endpoint || debug.endpoint,
-          localEndpoint: current?.localEndpoint || debug.localEndpoint || '/api/image-tasks',
-          taskId: event.id,
-          taskStatus: event.status,
-          elapsed: event.elapsed,
-          statusCode: event.statusCode,
-          upstreamTaskId: event.upstreamTaskId,
-          upstreamTaskStatusUrl: event.upstreamTaskStatusUrl,
-          error: event.error,
-          payload: current?.payload || debug.payload,
-        }))
-        setLastRun({
-          status: 'running',
-          message: [
-            `本地任务 ${event.id}：${event.status}`,
-            typeof event.elapsed === 'number' ? `elapsed: ${event.elapsed}ms` : '',
-            event.statusCode ? `status: ${event.statusCode}` : '',
-          ].filter(Boolean).join('，'),
-        })
-      })
-      setTasks((current) => [task, ...current])
+      const submittedTask = await submitImageTask(params, apiSettings)
+      latestRequestDebug = submittedTask.debug
+      setLastDebug(submittedTask.debug)
+      setTasks((current) => trimStoredTasks([
+        {
+          assets: [],
+          createdAt: submittedTask.submittedAt,
+          id: submittedTask.progress.id,
+          mode,
+          model,
+          prompt: prompt.trim(),
+          resumeParams: params,
+          status: submittedTask.progress.status === 'queued' ? 'pending' : 'running',
+        },
+        ...current,
+      ]))
+      const task = await pollImageTaskWithProgress(submittedTask, apiSettings, createProgressHandler(submittedTask.debug, (nextDebug) => {
+        latestRequestDebug = nextDebug
+      }))
+      updateTaskById(task.id, () => task)
       setSelectedAsset(task.assets[0])
       setLastRun({
         status: 'succeeded',
@@ -206,7 +407,7 @@ function App() {
       const rawMessage = error instanceof Error ? error.message : '图像任务失败。'
       const message = summarizeFailure(error, latestRequestDebug)
       const failedTask: ImageTask = {
-        id: latestRequestDebug?.taskId || `failed_${crypto.randomUUID()}`,
+        id: latestRequestDebug?.taskId || createClientId('failed'),
         mode,
         model,
         prompt: prompt.trim(),
@@ -216,7 +417,7 @@ function App() {
         error: rawMessage,
         assets: [],
       }
-      setTasks((current) => [failedTask, ...current])
+      setTasks((current) => trimStoredTasks([failedTask, ...current]))
       setLastRun({
         status: 'failed',
         message,
@@ -237,7 +438,7 @@ function App() {
     try {
       const url = await readFileAsDataUrl(file)
       setSelectedAsset({
-        id: `upload_${crypto.randomUUID()}`,
+        id: createClientId('upload'),
         url,
         title: file.name || 'Uploaded reference',
         prompt: 'Uploaded reference image',
@@ -254,20 +455,52 @@ function App() {
   }
 
   function saveSettings() {
-    const normalizedBaseUrl = draftBaseUrl.trim().replace(/\/+$/, '') || defaultBaseUrl
+    const normalizedBaseUrl = normalizeBaseUrl(draftBaseUrl)
     const trimmedKey = draftApiKey.trim()
     if (!trimmedKey) {
       Toast.warning('请输入 API 令牌。')
       return
     }
-    setApiSettings({
+    const nextSettings = {
       baseUrl: normalizedBaseUrl,
       apiKey: trimmedKey,
-    })
+    }
+    setApiSettings(nextSettings)
+    persistApiSettings(nextSettings, rememberApiKey)
     setDraftBaseUrl(normalizedBaseUrl)
     setDraftApiKey(trimmedKey)
     setSettingsOpen(false)
-    Toast.success('API 设置已保存到当前浏览器会话。')
+    Toast.success(rememberApiKey ? 'API 设置和令牌已保存到当前浏览器。' : 'API 设置已保存，令牌仅保存在当前页面会话。')
+  }
+
+  function clearHistory() {
+    setTasks([])
+    setSelectedAsset(undefined)
+    window.localStorage.removeItem(imageHistoryStorageKey)
+    Toast.success('本地图片历史已清空。')
+  }
+
+  async function downloadAsset(asset: ImageAsset) {
+    try {
+      const response = asset.url.startsWith('data:')
+        ? await fetch(asset.url)
+        : await fetch(asset.url, { mode: asset.url.startsWith('http') ? 'cors' : 'same-origin' })
+      if (!response.ok) {
+        throw new Error(`下载图片失败 (${response.status})。`)
+      }
+      const blob = await response.blob()
+      const extension = blob.type.includes('jpeg') ? 'jpg' : blob.type.split('/')[1] || outputFormat || 'png'
+      const objectUrl = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = objectUrl
+      link.download = `${asset.title.replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '') || 'hono-image'}.${extension}`
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      URL.revokeObjectURL(objectUrl)
+    } catch (error) {
+      Toast.error(error instanceof Error ? error.message : '下载图片失败。')
+    }
   }
 
   return (
@@ -461,7 +694,7 @@ function App() {
                       </div>
                       <Space>
                         <Button icon={<ArrowRight size={14} />} size="small" onClick={() => continueFrom(asset)}>继续</Button>
-                        <Button icon={<IconDownload />} size="small" theme="borderless" />
+                        <Button icon={<IconDownload />} size="small" theme="borderless" onClick={() => downloadAsset(asset)} />
                       </Space>
                     </div>
                   </Card>
@@ -481,6 +714,9 @@ function App() {
           <div className="history-heading">
             <IconHistory />
             <Text strong>会话历史</Text>
+            {tasks.length ? (
+              <Button size="small" theme="borderless" onClick={clearHistory}>清空</Button>
+            ) : null}
           </div>
           {tasks.length ? (
             <div className="task-list">
@@ -540,8 +776,16 @@ function App() {
               autoComplete="off"
             />
           </label>
+          <label className="settings-check">
+            <input
+              checked={rememberApiKey}
+              type="checkbox"
+              onChange={(event) => setRememberApiKey(event.target.checked)}
+            />
+            <span>记住令牌</span>
+          </label>
           <Paragraph type="tertiary">
-            令牌只保存在当前页面内存中。刷新页面后需要重新输入，避免把客户令牌写入项目文件或本地持久化存储。
+            默认只在当前页面会话保存令牌；勾选后才写入当前浏览器 localStorage。请勿在公共设备上保存客户令牌。
           </Paragraph>
         </div>
       </Modal>

@@ -361,6 +361,18 @@
   border-color: #2e5aac;
 }
 
+.settings-form .settings-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.settings-form .settings-check input {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+}
+
 @media (max-width: 1100px) {
   .workspace {
     display: block;

@@ -33,6 +33,7 @@ export type ImageTask = {
   completedAt?: string
   error?: string
   assets: ImageAsset[]
+  resumeParams?: GenerationParams
 }
 
 export type ImageAsset = {

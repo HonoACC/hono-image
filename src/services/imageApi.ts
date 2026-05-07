@@ -1,4 +1,5 @@
 import type { ApiSettings, GenerationParams, ImageAsset, ImageModel, ImageTask, ImageTaskDebug } from '../types/image'
+import { createClientId } from '../utils/id'
 
 export async function listModels(): Promise<ImageModel[]> {
   return [
@@ -20,39 +21,7 @@ export async function listModels(): Promise<ImageModel[]> {
 }
 
 export async function createImageTask(params: GenerationParams, settings: ApiSettings): Promise<ImageTask> {
-  const route = resolveRoute(params)
-  const now = new Date().toISOString()
-  const payload = buildOpenAiImagePayload(params)
-  const task = await submitLocalImageTask({
-    payload,
-    route,
-    settings,
-  })
-  const completedTask = await pollLocalImageTask(task.id, settings)
-
-  if (completedTask.status === 'failed') {
-    throw new Error(completedTask.error?.message || '本地异步图像任务失败。')
-  }
-  if (completedTask.status !== 'succeeded') {
-    throw new Error(`本地异步图像任务未完成：${completedTask.status}`)
-  }
-
-  const responsePayload = completedTask.result ?? {}
-  const assets = normalizeTaskAssets(completedTask, params, now) || normalizeImageResponse(responsePayload, params, completedTask.id, now)
-  if (!assets.length) {
-    throw new Error(`接口没有返回可用图片。${describeImagePayload(responsePayload)}`)
-  }
-
-  return {
-    id: completedTask.id,
-    mode: params.mode,
-    model: params.model,
-    prompt: params.prompt,
-    status: 'succeeded',
-    createdAt: now,
-    completedAt: completedTask.completedAt || new Date().toISOString(),
-    assets,
-  }
+  return createImageTaskWithProgress(params, settings)
 }
 
 export async function createImageTaskWithProgress(
@@ -60,17 +29,52 @@ export async function createImageTaskWithProgress(
   settings: ApiSettings,
   onProgress?: (event: LocalImageTaskProgress) => void,
 ): Promise<ImageTask> {
+  const submittedTask = await submitImageTask(params, settings)
+  onProgress?.(submittedTask.progress)
+  return pollImageTaskWithProgress(submittedTask, settings, onProgress)
+}
+
+export function prepareImageTaskRequest(params: GenerationParams, settings: ApiSettings) {
   const route = resolveRoute(params)
-  const now = new Date().toISOString()
   const payload = buildOpenAiImagePayload(params)
-  const task = await submitLocalImageTask({
+  return {
+    debug: {
+      endpoint: `${normalizeBaseUrl(settings.baseUrl)}${route}`,
+      localEndpoint: '/api/image-tasks',
+      payload,
+    } satisfies ImageTaskDebug,
     payload,
     route,
+  }
+}
+
+export async function submitImageTask(params: GenerationParams, settings: ApiSettings) {
+  const request = prepareImageTaskRequest(params, settings)
+  const task = await submitLocalImageTask({
+    payload: request.payload,
+    route: request.route,
     settings,
   })
-  onProgress?.(task)
+  return {
+    debug: {
+      ...request.debug,
+      endpoint: task.target || request.debug.endpoint,
+      taskId: task.id,
+      taskStatus: task.status,
+    },
+    params,
+    progress: task,
+    submittedAt: new Date().toISOString(),
+  }
+}
 
-  const completedTask = await pollLocalImageTask(task.id, settings, onProgress)
+export async function pollImageTaskWithProgress(
+  submittedTask: SubmittedImageTask,
+  settings: ApiSettings,
+  onProgress?: (event: LocalImageTaskProgress) => void,
+): Promise<ImageTask> {
+  const now = submittedTask.submittedAt
+  const completedTask = await pollLocalImageTask(submittedTask.progress.id, settings, onProgress)
   if (completedTask.status === 'failed') {
     throw new Error(completedTask.error?.message || '本地异步图像任务失败。')
   }
@@ -79,16 +83,16 @@ export async function createImageTaskWithProgress(
   }
 
   const responsePayload = completedTask.result ?? {}
-  const assets = normalizeTaskAssets(completedTask, params, now) || normalizeImageResponse(responsePayload, params, completedTask.id, now)
+  const assets = normalizeTaskAssets(completedTask, submittedTask.params, now) || normalizeImageResponse(responsePayload, submittedTask.params, completedTask.id, now)
   if (!assets.length) {
     throw new Error(`接口没有返回可用图片。${describeImagePayload(responsePayload)}`)
   }
 
   return {
     id: completedTask.id,
-    mode: params.mode,
-    model: params.model,
-    prompt: params.prompt,
+    mode: submittedTask.params.mode,
+    model: submittedTask.params.model,
+    prompt: submittedTask.params.prompt,
     status: 'succeeded',
     createdAt: now,
     completedAt: completedTask.completedAt || new Date().toISOString(),
@@ -224,6 +228,13 @@ type LocalImageTaskProgress = {
   }
 }
 
+export type SubmittedImageTask = {
+  debug: ImageTaskDebug
+  params: GenerationParams
+  progress: LocalImageTaskProgress
+  submittedAt: string
+}
+
 function buildOpenAiImagePayload(params: GenerationParams) {
   if (params.apiMode === 'chat-image') {
     const model = params.model.endsWith(':image') ? params.model : `${params.model}:image`
@@ -309,7 +320,7 @@ function normalizeTaskAssets(
   return task.assets.map((asset, index) => ({
     createdAt: asset.createdAt || createdAt,
     height: params.size.includes('1536') ? 1536 : 900,
-    id: asset.id || `asset_${crypto.randomUUID()}`,
+    id: asset.id || createClientId('asset'),
     mode: params.mode,
     prompt: asset.prompt || params.prompt,
     taskId: asset.taskId || task.id,
@@ -371,7 +382,7 @@ function buildImageAsset({
   url: string
 }): ImageAsset {
   return {
-    id: `asset_${crypto.randomUUID()}`,
+    id: createClientId('asset'),
     taskId,
     url,
     title: `${params.mode === 'generate' ? 'Generated' : params.mode === 'edit' ? 'Edited' : 'Continued'} ${index + 1}`,

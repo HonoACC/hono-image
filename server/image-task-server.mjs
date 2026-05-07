@@ -13,6 +13,12 @@ const allowedRoutes = new Set([
   '/v1/images/edits',
   '/v1/chat/completions',
 ])
+const allowedBaseUrlHosts = new Set(
+  String(process.env.HONO_IMAGE_ALLOWED_HOSTS || 'api.honoacc.com,anyone.ai')
+    .split(',')
+    .map((host) => host.trim().toLowerCase())
+    .filter(Boolean),
+)
 const taskRetentionMs = 60 * 60 * 1000
 const tasks = new Map()
 
@@ -65,6 +71,12 @@ function readBaseUrl(req) {
   const parsed = new URL(baseUrl)
   if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
     throw new Error('Base URL 只支持 http 或 https。')
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error('Base URL 不允许包含用户名或密码。')
+  }
+  if (!allowedBaseUrlHosts.has(parsed.hostname.toLowerCase())) {
+    throw new Error(`Base URL host 不在白名单：${parsed.hostname}。允许：${[...allowedBaseUrlHosts].join(', ')}`)
   }
   return `${parsed.protocol}//${parsed.host}${parsed.pathname.replace(/\/+$/, '')}`
 }
@@ -230,9 +242,12 @@ function resolveLocalAssetPath(url) {
 }
 
 async function readImageReference(reference, index) {
+  const directImageUrl = reference && typeof reference === 'object' && typeof reference.image_url === 'string'
+    ? reference.image_url
+    : undefined
   const imageUrl = typeof reference === 'string'
     ? reference
-    : reference?.image_url?.url || reference?.imageUrl || reference?.url
+    : reference?.image_url?.url || directImageUrl || reference?.imageUrl || reference?.url
 
   if (!imageUrl || typeof imageUrl !== 'string') {
     throw new Error(`第 ${index + 1} 张参考图缺少 image_url。`)
