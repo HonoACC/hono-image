@@ -8,6 +8,7 @@ The app follows the same high-level pattern as LobeChat image generation:
 - local Node task server runs the long image request in the background
 - browser polls local task status
 - generated base64 images are cached under `.hono-image-cache`
+- image edits are converted to upstream `multipart/form-data` requests by the local task server
 
 API keys are entered in the browser UI and forwarded as request headers. They are not written to project files.
 

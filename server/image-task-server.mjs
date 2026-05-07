@@ -165,13 +165,17 @@ async function requestUpstream({ authorization, body, contentType, method, url }
   }, 600_000)
 
   try {
+    const headers = {
+      Accept: 'application/json',
+      Authorization: authorization,
+    }
+    if (contentType) {
+      headers['Content-Type'] = contentType
+    }
+
     const response = await fetch(url, {
       body,
-      headers: {
-        Accept: 'application/json',
-        Authorization: authorization,
-        'Content-Type': contentType,
-      },
+      headers,
       method,
       signal: controller.signal,
     })
@@ -192,6 +196,102 @@ async function requestUpstream({ authorization, body, contentType, method, url }
   } finally {
     clearTimeout(timeout)
   }
+}
+
+function mimeToExtension(mimeType) {
+  const normalized = String(mimeType || '').toLowerCase().split(';')[0]
+  if (normalized === 'image/jpeg' || normalized === 'image/jpg') return 'jpg'
+  if (normalized === 'image/webp') return 'webp'
+  if (normalized === 'image/gif') return 'gif'
+  return 'png'
+}
+
+function parseDataUrl(dataUrl) {
+  const match = String(dataUrl || '').match(/^data:([^;,]+)(;base64)?,(.*)$/)
+  if (!match) return undefined
+
+  const mimeType = match[1] || 'application/octet-stream'
+  const isBase64 = Boolean(match[2])
+  const body = isBase64
+    ? Buffer.from(match[3], 'base64')
+    : Buffer.from(decodeURIComponent(match[3]), 'utf8')
+
+  return { body, mimeType }
+}
+
+function resolveLocalAssetPath(url) {
+  const cleanUrl = String(url || '').split('?')[0]
+  if (!cleanUrl.startsWith('/api/image-assets/')) return undefined
+  const fileName = decodeURIComponent(cleanUrl.replace(/^\/api\/image-assets\//, ''))
+  if (!/^[a-zA-Z0-9_.-]+$/.test(fileName)) {
+    throw new Error('无效的本地参考图文件名。')
+  }
+  return path.join(outputDir, fileName)
+}
+
+async function readImageReference(reference, index) {
+  const imageUrl = typeof reference === 'string'
+    ? reference
+    : reference?.image_url?.url || reference?.imageUrl || reference?.url
+
+  if (!imageUrl || typeof imageUrl !== 'string') {
+    throw new Error(`第 ${index + 1} 张参考图缺少 image_url。`)
+  }
+
+  if (imageUrl.startsWith('data:')) {
+    const parsed = parseDataUrl(imageUrl)
+    if (!parsed) throw new Error(`第 ${index + 1} 张参考图不是有效 data URL。`)
+    return {
+      blob: new Blob([parsed.body], { type: parsed.mimeType }),
+      fileName: `reference-${index + 1}.${mimeToExtension(parsed.mimeType)}`,
+    }
+  }
+
+  const localAssetPath = resolveLocalAssetPath(imageUrl)
+  if (localAssetPath) {
+    const body = await readFile(localAssetPath)
+    const mimeType = contentTypeFor(localAssetPath).split(';')[0]
+    return {
+      blob: new Blob([body], { type: mimeType }),
+      fileName: path.basename(localAssetPath),
+    }
+  }
+
+  if (/^https?:\/\//.test(imageUrl)) {
+    const response = await fetch(imageUrl)
+    if (!response.ok) {
+      throw new Error(`下载第 ${index + 1} 张参考图失败 (${response.status})。`)
+    }
+    const arrayBuffer = await response.arrayBuffer()
+    const mimeType = response.headers.get('content-type')?.split(';')[0] || 'image/png'
+    return {
+      blob: new Blob([arrayBuffer], { type: mimeType }),
+      fileName: `reference-${index + 1}.${mimeToExtension(mimeType)}`,
+    }
+  }
+
+  throw new Error(`不支持的参考图地址：${imageUrl}`)
+}
+
+async function buildEditFormData(payload) {
+  const formData = new FormData()
+  const images = Array.isArray(payload.images) ? payload.images : []
+  if (!images.length) {
+    throw new Error('/v1/images/edits 需要至少一张参考图。')
+  }
+
+  for (const [key, value] of Object.entries(payload)) {
+    if (key === 'images' || value === undefined || value === null || value === '') continue
+    if (typeof value === 'object') continue
+    formData.append(key, String(value))
+  }
+
+  for (const [index, image] of images.entries()) {
+    const reference = await readImageReference(image, index)
+    formData.append('image', reference.blob, reference.fileName)
+  }
+
+  return formData
 }
 
 function normalizeOutputFormat(format = 'png') {
@@ -280,10 +380,14 @@ async function runTask({ authorization, payload, task }) {
   task.updatedAt = task.startedAt
 
   try {
+    const isEditRoute = task.route === '/v1/images/edits'
+    const upstreamBody = isEditRoute
+      ? await buildEditFormData(payload)
+      : Buffer.from(JSON.stringify(payload))
     const upstreamResponse = await requestUpstream({
       authorization,
-      body: Buffer.from(JSON.stringify(payload)),
-      contentType: 'application/json',
+      body: upstreamBody,
+      contentType: isEditRoute ? undefined : 'application/json',
       method: 'POST',
       url: task.target,
     })
